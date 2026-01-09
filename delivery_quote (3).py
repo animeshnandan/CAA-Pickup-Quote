@@ -3,11 +3,7 @@
 # - ZIP search uses 🔍 Search button
 # - City/State search uses 🔍 Search button (city updates immediately after state selection)
 # - Search history shown (deduped: repeat searches update/move existing entry)
-# - Fixes NJ/NH/MA (and any full state names / punctuation like "N.J.") by normalizing state values
-#
-# Run:
-#   pip install streamlit pandas openpyxl
-#   streamlit run app.py
+# - Fixes leading-zero ZIPs (e.g., 01002) that Excel may store as 1002
 
 import re
 from pathlib import Path
@@ -29,7 +25,6 @@ DEFAULT_XLSX_PATH = APP_DIR / "Pickup zipcode CAA 3 locations.xlsx"
 EXPECTED_PRICES = {175, 200, 225, 250, 325, 525}
 REQUIRED_COLUMNS = ["zipcode", "city", "state"]
 
-# Common full-name -> abbreviation (extend anytime)
 STATE_NAME_TO_ABBR = {
     "NEW JERSEY": "NJ",
     "NEW HAMPSHIRE": "NH",
@@ -44,38 +39,38 @@ def _sheet_to_price(sheet_name: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 def _normalize_zip(z: Any) -> str:
-    """Return a 5-digit ZIP or '' if invalid. Handles 20855.0, 20855-1234, etc."""
+    """
+    Return a 5-digit ZIP or '' if invalid.
+    IMPORTANT: supports leading-zero ZIPs that Excel may convert to numbers.
+      - 01002 stored as 1002 -> "01002"
+      - 20855-1234 -> "20855"
+      - 20855.0 -> "20855"
+    """
     if z is None:
         return ""
+
     s = str(z).strip()
-    s = re.sub(r"\.0$", "", s)
-    digits = re.sub(r"\D", "", s)
-    if len(digits) < 5:
+    s = re.sub(r"\.0$", "", s)  # handle "20855.0"
+
+    digits = re.sub(r"\D", "", s)  # keep only digits
+    if not digits:
         return ""
+
+    # If Excel dropped a leading zero, we may get 1-4 digits; pad to 5.
+    if len(digits) <= 5:
+        return digits.zfill(5)
+
+    # ZIP+4 or longer strings: take first 5 digits
     return digits[:5].zfill(5)
 
 def _normalize_state(s: Any) -> str:
-    """
-    Normalizes state to 2-letter code.
-    Handles:
-      - 'New Jersey' -> 'NJ'
-      - 'N.J.' -> 'NJ'
-      - 'MA ' -> 'MA'
-      - 'NH.' -> 'NH'
-    """
     if s is None:
         return ""
     t = str(s).strip().upper()
-
-    # full-name mapping
     if t in STATE_NAME_TO_ABBR:
         return STATE_NAME_TO_ABBR[t]
-
-    # strip non letters and take first 2
     letters = re.sub(r"[^A-Z]", "", t)
-    if len(letters) >= 2:
-        return letters[:2]
-    return ""
+    return letters[:2] if len(letters) >= 2 else ""
 
 def _cleanframe(df: pd.DataFrame, price: int) -> pd.DataFrame:
     cols_lower = {c.lower().strip(): c for c in df.columns}
@@ -98,9 +93,6 @@ def _cleanframe(df: pd.DataFrame, price: int) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_pricing(xlsx_file: str) -> pd.DataFrame:
-    """
-    xlsx_file: string path (keeps Streamlit cache stable across OS/platform)
-    """
     try:
         xls = pd.ExcelFile(xlsx_file, engine="openpyxl")
     except ImportError as e:
@@ -123,7 +115,7 @@ def load_pricing(xlsx_file: str) -> pd.DataFrame:
 
     full = pd.concat(frames, ignore_index=True)
 
-    # Keep the lowest quote per ZIP (your original behavior)
+    # Keep lowest quote per ZIP
     full = (
         full.sort_values(["zipcode", "quote"], ascending=[True, True])
         .drop_duplicates(subset=["zipcode"], keep="first")
@@ -139,7 +131,6 @@ def lookup_by_zip(df: pd.DataFrame, zipcode: Any) -> pd.DataFrame:
     return df.loc[df["zipcode"] == z]
 
 def lookup_by_city_state(df: pd.DataFrame, city_title: str, state: str) -> pd.DataFrame:
-    # df stores city/state UPPER; UI city is Title Case
     c = (city_title or "").strip().upper()
     s = _normalize_state(state)
     if not c or not s:
@@ -149,13 +140,7 @@ def lookup_by_city_state(df: pd.DataFrame, city_title: str, state: str) -> pd.Da
 def format_city(city_upper: str) -> str:
     return str(city_upper).title()
 
-def upsert_history(
-    history: List[Dict[str, Any]],
-    key: Tuple[Any, ...],
-    record: Dict[str, Any],
-    max_len: int = 25,
-):
-    """Deduped history: if key exists, remove old entry and insert updated record at top."""
+def upsert_history(history: List[Dict[str, Any]], key: Tuple[Any, ...], record: Dict[str, Any], max_len: int = 25):
     idx = None
     for i, item in enumerate(history):
         if item.get("_key") == key:
@@ -174,11 +159,9 @@ def upsert_history(
 # -------------------------
 if "zip_history" not in st.session_state:
     st.session_state.zip_history = []
-
 if "cs_history" not in st.session_state:
     st.session_state.cs_history = []
 
-# Keep current selectors in session_state so the City dropdown updates immediately
 st.session_state.setdefault("cs_state", None)
 st.session_state.setdefault("cs_city", None)
 
@@ -216,7 +199,7 @@ if mode == "ZIP code":
     zip_input = st.text_input(
         "ZIP",
         placeholder="Enter 5-digit ZIP",
-        max_chars=10,  # allow ZIP+4 paste, we normalize
+        max_chars=10,  # allow ZIP+4 paste
         label_visibility="collapsed",
         key="zip_input",
     )
@@ -225,44 +208,32 @@ if mode == "ZIP code":
     if submitted:
         norm_zip = _normalize_zip(zip_input)
         if not norm_zip:
-            st.warning("Please enter a valid 5-digit ZIP.")
+            st.warning("Please enter a valid ZIP (up to 5 digits).")
         else:
             result = lookup_by_zip(pricing, norm_zip)
-
             if result.empty:
                 st.error(f"No match for ZIP **{norm_zip}**")
-                upsert_history(
-                    st.session_state.zip_history,
-                    key=(norm_zip,),
-                    record={"zip": norm_zip, "result": "No match"},
-                )
+                upsert_history(st.session_state.zip_history, key=(norm_zip,), record={"zip": norm_zip, "result": "No match"})
             else:
                 quote = int(result["quote"].iloc[0])
                 st.success(f"✅ Quote for **{norm_zip}**: **${quote}**")
                 st.dataframe(
-                    result.rename(
-                        columns={"zipcode": "ZIP", "city": "City", "state": "State", "quote": "Quote ($)"}
-                    ),
+                    result.rename(columns={"zipcode": "ZIP", "city": "City", "state": "State", "quote": "Quote ($)"}),
                     use_container_width=True,
                 )
-                upsert_history(
-                    st.session_state.zip_history,
-                    key=(norm_zip,),
-                    record={"zip": norm_zip, "result": f"${quote}"},
-                )
+                upsert_history(st.session_state.zip_history, key=(norm_zip,), record={"zip": norm_zip, "result": f"${quote}"})
 
     if st.session_state.zip_history:
         st.divider()
         st.subheader("Recent ZIP searches")
         for item in st.session_state.zip_history[:10]:
             st.write(f"{item['zip']} — {item['result']}")
-
         if st.button("Clear ZIP history"):
             st.session_state.zip_history = []
             st.rerun()
 
 # -------------------------
-# City & State mode (city updates immediately after state selection)
+# City & State mode
 # -------------------------
 else:
     col1, col2 = st.columns(2)
@@ -277,7 +248,6 @@ else:
             key="cs_state",
         )
 
-    # Build city options based on selected state (updates immediately on change)
     if sel_state:
         cities_upper = (
             pricing.loc[pricing["state"] == sel_state, "city"]
@@ -288,10 +258,8 @@ else:
         cities_upper = sorted(cities_upper)
         city_options_title = [format_city(c) for c in cities_upper]
     else:
-        cities_upper = []
         city_options_title = []
 
-    # If state changed and previously selected city isn't in new list, clear city selection
     if st.session_state.get("cs_city") and st.session_state["cs_city"] not in city_options_title:
         st.session_state["cs_city"] = None
 
@@ -316,11 +284,7 @@ else:
 
             if result.empty:
                 st.error(f"No match for **{desc}**")
-                upsert_history(
-                    st.session_state.cs_history,
-                    key=(sel_state, sel_city_title),
-                    record={"desc": desc, "result": "No match"},
-                )
+                upsert_history(st.session_state.cs_history, key=(sel_state, sel_city_title), record={"desc": desc, "result": "No match"})
             else:
                 min_q, max_q = int(result["quote"].min()), int(result["quote"].max())
                 result_text = f"${min_q}" if min_q == max_q else f"${min_q}–${max_q}"
@@ -330,19 +294,13 @@ else:
                     result[["zipcode", "quote"]].rename(columns={"zipcode": "ZIP", "quote": "Quote ($)"}),
                     use_container_width=True,
                 )
-
-                upsert_history(
-                    st.session_state.cs_history,
-                    key=(sel_state, sel_city_title),
-                    record={"desc": desc, "result": result_text},
-                )
+                upsert_history(st.session_state.cs_history, key=(sel_state, sel_city_title), record={"desc": desc, "result": result_text})
 
     if st.session_state.cs_history:
         st.divider()
         st.subheader("Recent City/State searches")
         for item in st.session_state.cs_history[:10]:
             st.write(f"{item['desc']} — {item['result']}")
-
         if st.button("Clear City/State history"):
             st.session_state.cs_history = []
             st.rerun()
