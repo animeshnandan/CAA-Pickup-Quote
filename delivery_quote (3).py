@@ -16,6 +16,8 @@ from typing import List, Optional, Dict, Any, Tuple
 import pandas as pd
 import streamlit as st
 
+APP_DIR = Path(__file__).resolve().parent
+
 # -------------------------
 # Config
 # -------------------------
