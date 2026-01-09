@@ -306,4 +306,3 @@ else:
             st.rerun()
 
 st.divider()
-st.markdown(f"Can’t find a location? **[Refer to our partner here]({PARTNER_LINK})**.")
